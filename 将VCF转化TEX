@@ -1,0 +1,11 @@
+#安装数据包
+install.packages("data.table")
+
+#读取数据包
+library(data.table)
+
+# 用 fread 自动跳过以 "##" 开头的注释行
+vcf <- fread("D:/文献相关河南大学硕士/R语言需要用到的数据/CAN25/CAN25.vcf", skip = "#CHROM")
+
+#写入文件夹
+write.table(vcf, "D:/文献相关河南大学硕士/R语言需要用到的数据/CAN25.txt", sep = "\t", quote = FALSE, row.names = FALSE)

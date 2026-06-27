@@ -1,0 +1,343 @@
+#  SNP 示例数据探索性分析 (Exploratory Data Analysis)
+# ================================================================
+# 目的: 在计算 Fst 之前, 先全面了解你的 SNP 数据
+# 输入: VCF 文件 + pop_info.txt
+# 输出: 质量控制图表 + 群体结构初步分析
+# ================================================================
+
+# ---- 0. 安装/加载 R 包 ----
+required_pkgs <- c("vcfR", "adegenet", "SNPRelate", "gdsfmt",
+                    "ggplot2", "reshape2", "dplyr", "patchwork")
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+setwd("E:/Codex——AI")
+dir.create("eda_results", showWarnings = FALSE)
+
+vcf_file <- "example_snp.vcf"
+pop_file <- "pop_info.txt"
+
+# ================================================================
+#  1. 读取数据概览
+# ================================================================
+
+cat("========== SNP 数据探索性分析 ==========\n\n")
+
+# ---- 1a. 用 vcfR 读取 VCF 基本信息 ----
+cat("[1/8] 读取 VCF 基本信息 ...\n")
+vcf <- read.vcfR(vcf_file, verbose = FALSE)
+cat(sprintf("  个体数: %d\n", ncol(vcf@gt) - 1))
+cat(sprintf("  SNP 数: %d\n", nrow(vcf@fix)))
+cat(sprintf("  染色体数: %d\n", length(unique(vcf@fix[, 1]))))
+cat(sprintf("  染色体列表: %s\n", paste(unique(vcf@fix[, 1]), collapse = ", ")))
+cat(sprintf("  位置范围: %d ~ %d\n",
+            min(as.integer(vcf@fix[, 2]), na.rm = TRUE),
+            max(as.integer(vcf@fix[, 2]), na.rm = TRUE)))
+
+# ---- 1b. 读取群体信息 ----
+pop_df <- read.table(pop_file, header = TRUE, stringsAsFactors = FALSE)
+cat(sprintf("  群体数: %d\n", length(unique(pop_df$pop))))
+cat(sprintf("  群体组成: %s\n",
+            paste(sapply(unique(pop_df$pop),
+                         function(p) sprintf("%s(%d)", p, sum(pop_df$pop == p))),
+                  collapse = ", ")))
+
+# ================================================================
+#  2. 缺失率分析
+# ================================================================
+
+cat("\n[2/8] 计算缺失率 ...\n")
+
+# 提取基因型矩阵并计算缺失率
+gt_matrix <- extract.gt(vcf, element = "GT", as.numeric = FALSE)
+miss_by_snp <- apply(gt_matrix, 1, function(x) sum(is.na(x)) / length(x))
+miss_by_ind <- apply(gt_matrix, 2, function(x) sum(is.na(x)) / length(x))
+
+cat(sprintf("  SNP 缺失率: 均值=%.4f, 最大=%.4f\n",
+            mean(miss_by_snp), max(miss_by_snp)))
+cat(sprintf("  个体缺失率: 均值=%.4f, 最大=%.4f\n",
+            mean(miss_by_ind), max(miss_by_ind)))
+
+# 缺失率分布图
+p_miss_snp <- ggplot(data.frame(Missing = miss_by_snp), aes(x = Missing)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.8) +
+  labs(title = "SNP Missing Rate", x = "Missing Rate", y = "Count") +
+  theme_minimal()
+
+p_miss_ind <- ggplot(data.frame(Missing = miss_by_ind,
+                                Sample = rownames(gt_matrix)), aes(x = Sample, y = Missing)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(title = "Individual Missing Rate", x = "", y = "Missing Rate") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("eda_results/01_missing_rate.pdf",
+       p_miss_snp / p_miss_ind, width = 10, height = 6)
+
+# ================================================================
+#  3. 等位基因频率分布
+# ================================================================
+
+cat("\n[3/8] 计算等位基因频率 (MAF) ...\n")
+
+# 计算每个 SNP 的等位基因频率
+af <- apply(gt_matrix, 1, function(x) {
+  alleles <- na.omit(unlist(strsplit(x, "/")))
+  if (length(alleles) == 0) return(NA)
+  af_val <- sum(alleles == "0") / length(alleles)
+  return(min(af_val, 1 - af_val))  # MAF
+})
+
+cat(sprintf("  MAF 均值: %.4f\n", mean(af, na.rm = TRUE)))
+cat(sprintf("  MAF 中位数: %.4f\n", median(af, na.rm = TRUE)))
+cat(sprintf("  MAF < 0.05 的 SNP: %d (%.1f%%)\n",
+            sum(af < 0.05, na.rm = TRUE),
+            sum(af < 0.05, na.rm = TRUE) / length(na.omit(af)) * 100))
+
+p_maf <- ggplot(data.frame(MAF = na.omit(af)), aes(x = MAF)) +
+  geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.8) +
+  geom_vline(xintercept = 0.05, color = "red", linetype = "dashed") +
+  labs(title = "Minor Allele Frequency Distribution",
+       subtitle = "红线 = MAF 0.05 阈值", x = "MAF", y = "Count") +
+  theme_minimal()
+ggsave("eda_results/02_maf_distribution.pdf", p_maf, width = 8, height = 5)
+
+# ================================================================
+#  4. 基因型频率 (按群体) 热图
+# ================================================================
+
+cat("\n[4/8] 生成基因型热图 (前 50 个 SNP) ...\n")
+
+# 取前 50 个 SNP 展示
+n_show <- min(50, nrow(gt_matrix))
+gt_subset <- gt_matrix[1:n_show, ]
+
+# 将基因型转换为数值 (0/0=0, 0/1=1, 1/1=2)
+gt_num <- apply(gt_subset, 2, function(x) {
+  sapply(x, function(gt) {
+    if (is.na(gt)) return(NA)
+    if (gt == "0/0") return(0)
+    if (gt == "0/1") return(1)
+    if (gt == "1/1") return(2)
+    return(NA)
+  })
+})
+
+# 按群体排序
+pop_vec <- pop_df$pop[match(colnames(gt_subset), pop_df$sample)]
+order_idx <- order(pop_vec)
+gt_num <- gt_num[, order_idx]
+pop_ordered <- pop_vec[order_idx]
+
+# 绘制热图
+gt_long <- melt(gt_num, varnames = c("SNP", "Sample"), value.name = "Genotype")
+gt_long$Population <- pop_ordered[match(gt_long$Sample, colnames(gt_num))]
+
+p_heat <- ggplot(gt_long, aes(x = Sample, y = SNP, fill = factor(Genotype))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "#f7f7f7", "1" = "#b2df8a", "2" = "#1f78b4"),
+                    labels = c("0/0", "0/1", "1/1"), name = "Genotype") +
+  facet_grid(~ Population, scales = "free_x", space = "free") +
+  labs(title = paste0("Genotype Heatmap (Top ", n_show, " SNPs)"),
+       x = "Individual", y = "SNP") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+ggsave("eda_results/03_genotype_heatmap.pdf", p_heat, width = 10, height = 6)
+
+# ================================================================
+#  5. PCA 分析 (群体结构)
+# ================================================================
+
+cat("\n[5/8] PCA 分析 (SNPRelate) ...\n")
+
+# VCF → GDS (临时)
+gds_file <- "temp_eda.gds"
+snpgdsVCF2GDS(vcf_file, gds_file, method = "biallelic.only",
+              snpfirstdim = FALSE, verbose = FALSE)
+
+gds <- snpgdsOpen(gds_file)
+
+# LD pruning (避免 SNP 间连锁影响 PCA)
+set.seed(42)
+snpset <- snpgdsLDpruning(gds, ld.threshold = 0.2, verbose = FALSE)
+snpset_ids <- unlist(snpset, use.names = FALSE)
+cat(sprintf("  LD pruning 后 SNP 数: %d\n", length(snpset_ids)))
+
+# PCA
+pca_result <- snpgdsPCA(gds, snp.id = snpset_ids, num.thread = 1, verbose = FALSE)
+eigenval <- pca_result$eigenval
+var_ratio <- eigenval / sum(eigenval) * 100
+
+cat(sprintf("  PC1: %.1f%%, PC2: %.1f%%, PC3: %.1f%%\n",
+            var_ratio[1], var_ratio[2], var_ratio[3]))
+
+# PCA 结果 + 群体信息
+pca_df <- data.frame(
+  Sample = pca_result$sample.id,
+  PC1 = pca_result$eigenvect[, 1],
+  PC2 = pca_result$eigenvect[, 2],
+  PC3 = pca_result$eigenvect[, 3]
+)
+pca_df$Population <- pop_df$pop[match(pca_df$Sample, pop_df$sample)]
+
+# PCA 图
+p_pca12 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Population)) +
+  geom_point(size = 4, alpha = 0.85) +
+  stat_ellipse(level = 0.75, linewidth = 0.8) +
+  labs(title = "PCA (PC1 vs PC2)",
+       x = sprintf("PC1 (%.1f%%)", var_ratio[1]),
+       y = sprintf("PC2 (%.1f%%)", var_ratio[2])) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+p_pca13 <- ggplot(pca_df, aes(x = PC1, y = PC3, color = Population)) +
+  geom_point(size = 4, alpha = 0.85) +
+  stat_ellipse(level = 0.75, linewidth = 0.8) +
+  labs(title = "PCA (PC1 vs PC3)",
+       x = sprintf("PC1 (%.1f%%)", var_ratio[1]),
+       y = sprintf("PC3 (%.1f%%)", var_ratio[3])) +
+  theme_minimal() + theme(legend.position = "bottom")
+
+p_pca <- p_pca12 + p_pca13 + plot_layout(guides = "collect")
+ggsave("eda_results/04_pca.pdf", p_pca, width = 12, height = 5)
+
+snpgdsClose(gds)
+unlink(gds_file)
+
+# ================================================================
+#  6. 按群体等位基因频率比较
+# ================================================================
+
+cat("\n[6/8] 按群体计算等位基因频率 ...\n")
+
+pop_names <- unique(pop_df$pop)
+af_by_pop <- data.frame(SNP = 1:nrow(gt_matrix))
+
+for (pop in pop_names) {
+  pop_samples <- pop_df$sample[pop_df$pop == pop]
+  pop_cols <- intersect(pop_samples, colnames(gt_matrix))
+  af_pop <- apply(gt_matrix[, pop_cols, drop = FALSE], 1, function(x) {
+    alleles <- na.omit(unlist(strsplit(x, "/")))
+    if (length(alleles) == 0) return(NA)
+    return(sum(alleles == "1") / length(alleles))  # ALT 频率
+  })
+  af_by_pop[[pop]] <- af_pop
+}
+
+# 两两群体间等位基因频率散点图
+pairs_list <- combn(pop_names, 2, simplify = FALSE)
+for (pair in pairs_list) {
+  p1 <- pair[1]; p2 <- pair[2]
+  cor_val <- cor(af_by_pop[[p1]], af_by_pop[[p2]], use = "complete.obs")
+
+  p_af <- ggplot(af_by_pop, aes(x = !!sym(p1), y = !!sym(p2))) +
+    geom_point(alpha = 0.2, size = 0.5, color = "steelblue") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+             label = sprintf("r = %.3f", cor_val), size = 4) +
+    labs(title = sprintf("Allele Frequency: %s vs %s", p1, p2),
+         x = paste(p1, "ALT freq"), y = paste(p2, "ALT freq")) +
+    xlim(0, 1) + ylim(0, 1) + theme_minimal()
+  ggsave(sprintf("eda_results/05_af_comparison_%s_vs_%s.pdf", p1, p2),
+         p_af, width = 6, height = 5)
+}
+
+cat("  已保存等位基因频率对比图\n")
+
+# ================================================================
+#  7. 杂合度分析 (观测 vs 期望)
+# ================================================================
+
+cat("\n[7/8] 计算个体杂合度 ...\n")
+
+ho <- numeric(ncol(gt_matrix))
+he <- numeric(ncol(gt_matrix))
+names(ho) <- colnames(gt_matrix)
+
+for (i in seq_len(ncol(gt_matrix))) {
+  gts <- na.omit(gt_matrix[, i])
+  n <- length(gts)
+  n_het <- sum(gts == "0/1")
+  ho[i] <- n_het / n
+  p <- sum(gts == "0/0") * 2 + sum(gts == "0/1")
+  p <- p / (2 * n)
+  he[i] <- 2 * p * (1 - p)
+}
+
+het_df <- data.frame(
+  Sample = names(ho),
+  Ho = ho,
+  He = he,
+  Population = pop_df$pop[match(names(ho), pop_df$sample)]
+)
+
+p_het <- ggplot(het_df, aes(x = Population, y = Ho, fill = Population)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.8, color = "black") +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "red") +
+  labs(title = "Observed Heterozygosity by Population",
+       subtitle = "红色菱形 = 均值", y = "Ho") +
+  theme_minimal() + theme(legend.position = "none")
+ggsave("eda_results/06_heterozygosity.pdf", p_het, width = 8, height = 5)
+
+# ================================================================
+#  8. 生成汇总报告
+# ================================================================
+
+cat("\n[8/8] 生成 EDA 汇总报告 (R markdown 格式) ...\n")
+
+sink("eda_results/EDA_REPORT.txt")
+cat("================================================================\n")
+cat("  SNP 数据探索性分析报告\n")
+cat("================================================================\n\n")
+cat(sprintf("分析日期: %s\n", Sys.Date()))
+cat(sprintf("VCF 文件: %s\n", vcf_file))
+cat("\n")
+
+cat("--- 基本信息 ---\n")
+cat(sprintf("  样本数: %d\n", ncol(vcf@gt) - 1))
+cat(sprintf("  SNP 数: %d\n", nrow(vcf@fix)))
+cat(sprintf("  染色体数: %d\n", length(unique(vcf@fix[, 1]))))
+cat(sprintf("  群体数: %d\n", length(pop_names)))
+cat(sprintf("  群体组成: %s\n",
+            paste(sprintf("%s(n=%d)", pop_names,
+                          sapply(pop_names, function(p) sum(pop_df$pop == p))),
+                  collapse = ", ")))
+cat("\n")
+
+cat("--- 数据质量 ---\n")
+cat(sprintf("  SNP 平均缺失率: %.4f\n", mean(miss_by_snp)))
+cat(sprintf("  个体平均缺失率: %.4f\n", mean(miss_by_ind)))
+cat(sprintf("  MAF < 0.05 的 SNP: %d (%.1f%%)\n",
+            sum(af < 0.05, na.rm = TRUE),
+            sum(af < 0.05, na.rm = TRUE) / length(na.omit(af)) * 100))
+cat("\n")
+
+cat("--- 群体结构 (PCA) ---\n")
+cat(sprintf("  PC1 方差解释: %.1f%%\n", var_ratio[1]))
+cat(sprintf("  PC2 方差解释: %.1f%%\n", var_ratio[2]))
+cat(sprintf("  PC3 方差解释: %.1f%%\n", var_ratio[3]))
+cat("\n")
+
+cat("--- 杂合度 ---\n")
+for (pop in pop_names) {
+  sub <- het_df[het_df$Population == pop, ]
+  cat(sprintf("  %s: 平均 Ho=%.4f, 平均 He=%.4f\n",
+              pop, mean(sub$Ho), mean(sub$He)))
+}
+cat("\n")
+
+cat("--- 输出文件 ---\n")
+cat("  eda_results/01_missing_rate.pdf       - 缺失率分布\n")
+cat("  eda_results/02_maf_distribution.pdf    - MAF 分布\n")
+cat("  eda_results/03_genotype_heatmap.pdf    - 基因型热图\n")
+cat("  eda_results/04_pca.pdf                - PCA 图\n")
+cat("  eda_results/05_af_comparison_*.pdf     - 等位基因频率对比\n")
+cat("  eda_results/06_heterozygosity.pdf     - 杂合度\n")
+cat("================================================================\n")
+sink()
+
+cat("\n✅ EDA 完成! 所有结果保存到 eda_results/ 目录\n")
+cat("   文本报告: eda_results/EDA_REPORT.txt\n")
